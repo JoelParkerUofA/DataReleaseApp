@@ -1,0 +1,183 @@
+---
+output:
+   html_document:
+    self_contained: true
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r setup}
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = Sys.getenv("user")
+                 , password = Sys.getenv("password")
+                 , dbname = Sys.getenv("dbname")
+                 , host = Sys.getenv("host")
+                 , port = Sys.getenv("port")
+                 , sslrootcert = 'global-bundle.pem'
+)
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+```{r get-participant-information}
+
+# Need to pull participant info to calculate whether participant attempted game within consent date range
+
+# HML ID created dates, ids, and recruitment site
+info_hml_id_data <- dbReadTable(con, "info_hml_id_data") %>%
+  select(hml_id, hml_id_created_date, participant_id_parent = participant_id, site = area)
+
+## Get secondary participant_ids
+participant_id_dat <- dbReadTable(con, "views_all_ids") %>%
+  select(hml_id, participant_id = participant_ids) %>%
+  separate_rows(participant_id)
+
+# Get eligibility date
+participant_elig_dat <- dbReadTable(con, "p2_redcap_consent_form") %>%
+  select(hml_id, main_consent_date)
+
+# Date buffer for filtering games +/- days around participant HML ID generation date
+date_buffer <- 90
+
+# HML ID app created date
+hml_app_start_date <- as.Date("2023-10-01")
+
+# Combine id data and generate filtering dates for games
+participant_data <- info_hml_id_data %>%
+  left_join(participant_id_dat, by = "hml_id") %>%
+  left_join(participant_elig_dat, by = "hml_id") %>%
+  mutate(
+    # A date was saved in an incorrect format:
+    hml_id_created_date = ifelse(hml_id_created_date == "9/5/24", "2024-09-05", hml_id_created_date),
+    hml_id_created_date = as.Date(hml_id_created_date),
+    main_consent_date = as.Date(main_consent_date),
+    filter_date = as.Date(case_when(
+      # Use consent date if participant was consented before app was created
+      hml_id_created_date < hml_app_start_date ~ main_consent_date,
+      # Use HML ID if pre-app participant is missing consent date
+      is.na(main_consent_date) ~ hml_id_created_date,
+      # Use HML ID created date generally
+      TRUE ~ hml_id_created_date)),
+    # Some participants were missed in the previous filter
+    filter_date = as.Date(ifelse(is.na(filter_date), hml_id_created_date, filter_date)),
+    first_date_before = as.Date(filter_date - date_buffer),
+    first_date_after = as.Date(filter_date + date_buffer),
+    # Add second visit range
+    second_date_before = as.Date(filter_date - date_buffer) + 365*2,
+    second_date_after = as.Date(filter_date + date_buffer) + 365*2,
+    # If not eligible for second visit yet, replace date with NA
+    second_date_before = ifelse(second_date_before < Sys.Date(), as.character(second_date_before), NA),
+    second_date_after = ifelse(!is.na(second_date_before), as.character(second_date_after), NA)) %>%
+  select(-c(hml_id_created_date, main_consent_date, filter_date)) %>%
+  # 2025-03-21: Participants logged into MC under different emails than what was used to assign HML IDs.
+  mutate(participant_id = case_when(hml_id == "HML0765" ~ "003Vu00000hTICAIA4",
+                                    hml_id == "HML0793" ~ "003Vu00000lDflWIAS",
+                                    TRUE ~ participant_id)) %>%
+  # Pivot longer so each visit gets a row
+  mutate(across(c(ends_with("date_before"), ends_with("date_after")), as.Date)) %>%
+  pivot_longer(cols = c(ends_with("date_before"), ends_with("date_after")),
+                        names_to = c("visit", "time"), names_pattern = "(.*)_date_(.*)") %>%
+  mutate(visit = case_when(visit == "first" ~ 1,
+                           visit == "second" ~ 2)) %>%
+  pivot_wider(id_cols = c(hml_id, participant_id_parent, participant_id, site, visit),
+              names_from = time, names_prefix = "range_", values_from = value) %>%
+  filter(!is.na(range_before)) %>%
+  # Only counting first visit for this first data freeze
+  filter(visit == 1) %>%
+  select(-visit) %>%
+  # Filter only people within freeze
+  filter(hml_id %in% freeze_ids)
+
+```
+
+```{r pull-mc-cognitive-function-task-data}
+
+names <- c("attention", "faces_names", "focus", "keep_track", "objects", "objects_spatial", 
+           "objects_temporal", "react", "shapes", "switching", "word_pairs")
+
+# Get main games data
+raw_files_list <- lapply(names, 
+                         function(x){
+                           # Get all games and only load rows with participant_ids matching participant_data$participant_id
+                           dbGetQuery(con, paste0("SELECT * FROM ", x, " WHERE participant_id IN ('", 
+                                                  paste0(participant_data$participant_id, collapse = "', '"), "')"))})
+names(raw_files_list) <- names
+
+files_list <- lapply(raw_files_list, function(x){
+  if(sum(str_detect(names(x), "created_date_game_session") > 0)){
+    names(x)[which(names(x) == "created_date_game_session")] <- "created_date_game_result"
+  }
+  
+  new_x <- participant_data %>%
+    left_join(x, by = "participant_id", relationship = "many-to-many") %>%
+    select(hml_id, site, everything()) %>%
+    filter(!is.na(created_date_game_result)) %>%
+    # Assign game status based on first and second visit ranges
+    mutate(out_of_date_range = ifelse(created_date_game_result >= range_before & 
+                                  created_date_game_result <= range_after,
+                                "N", "Y")) %>%
+    mutate(across(-c(contains("date"), range_before, range_after), ~ifelse(is.na(.), "", .))) %>%
+    mutate(created_date_game_result = as.Date(created_date_game_result)) %>%
+    filter(out_of_date_range == "N") %>%
+    # Get most recent, completed game within game range, if none exist then get most recent game for visit
+    group_by(hml_id) %>% 
+    mutate(time_since_range_end = abs(as.numeric(created_date_game_result - range_after))) %>%
+    arrange(out_of_date_range, time_since_range_end, desc(created_date_game_result)) %>% 
+    slice(1) %>% ungroup()  %>%
+    select(hml_id, game_name, game_status)
+  
+  game_name <- new_x$game_name[which(!is.na(new_x$game_name))][1] %>% 
+    str_to_lower() %>% str_replace(" ", "\\_") %>% str_remove_all("[^[:alpha:]|\\_]")
+  
+  game_name <- case_when(game_name == "objects_space" ~ "objects_spatial",
+                         game_name == "objects_time" ~ "objects_temporal",
+                         TRUE ~ game_name)
+  
+  names(new_x)[which(names(new_x) == "game_status")] <- paste0(game_name, "_game_status")
+  
+  new_x %>% select(-game_name)
+})
+
+overall_attempted <- files_list %>%
+  reduce(full_join, by = c("hml_id")) %>%
+  select(-hml_id) %>%
+  mutate(across(everything(), ~ifelse(is.na(.), "Not-Completed", .))) %>%
+  mutate(across(everything(), ~ifelse(. == "Not-Completed", 0, 1)))
+
+```
+
+```{r create-percent-available-table}
+
+overall_attempted %>%
+  pivot_longer(cols = everything(), names_to = "game", values_to = "available") %>%
+  group_by(game) %>%
+  mutate(total = n()) %>%
+  group_by(total, .add = TRUE) %>%
+  summarise(sum_available = sum(available)) %>%
+  ungroup() %>%
+  mutate(percent_available = round(sum_available/total, 3) * 100,
+         percent_available = paste0(sum_available, " (", percent_available, "%)")) %>%
+  select(game, percent_available) %>%
+  mutate(game = str_remove(game, "_game_status") %>% str_replace("_", " ") %>% str_to_title,
+         game = case_when(game == "Faces Names" ~ "Faces & Names",
+                          TRUE ~ game)) %>%
+  flextable() %>%
+  set_header_labels(game = "", percent_available = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit()
+
+```
+

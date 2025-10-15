@@ -1,0 +1,113 @@
+---
+output:
+   html_document:
+    self_contained: true
+execute:
+  echo: false
+  message: false
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = Sys.getenv("user")
+                 , password = Sys.getenv("password")
+                 , dbname = Sys.getenv("dbname")
+                 , host = Sys.getenv("host")
+                 , port = Sys.getenv("port")
+                 , sslrootcert = 'global-bundle.pem'
+)
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+## Psychosocial and Visits Table
+
+```{r pull-data}
+
+coref_mehl_languagespeechtask <- dbReadTable(con, "coref_mehl_languagespeechtask")
+
+coref_najafi_frailty <- dbReadTable(con, "coref_najafi_frailty")
+
+p2_redcap_biometrics <- dbReadTable(con, "p2_redcap_biometrics")
+
+p2_redcap_health_intake <- dbReadTable(con, "p2_redcap_health_intake")
+
+p2_redcap_cognitive_function_phq9 <- dbGetQuery(con, "SELECT hml_id, phq9_complete FROM p2_redcap_cognitive_function_phq9")
+
+```
+
+```{r wrangle-data}
+
+# Note: Need to check formantposition variable ("Not enough samples")
+
+language <- coref_mehl_languagespeechtask %>%
+  filter(hml_id %in% freeze_ids) %>%
+  select(hml_id, formantposition, inputfile) %>%
+  mutate(formantposition = ifelse(formantposition == "Not enough samples, requires at least 30", 1, 0)) %>%
+  summarise(missing_data = sum(formantposition, na.rm = T), .by = "hml_id") %>%
+  mutate(complete_language = ifelse(missing_data == 0, 1, 0)) %>%
+  summarise(`Language Speech Task` = sum(complete_language))
+
+frailty <- coref_najafi_frailty %>%
+  filter(hml_id %in% freeze_ids) %>%
+  select(DT_FI, ST_FI) %>%
+  mutate(across(everything(), ~ifelse(is.na(.), 1, 0))) %>%
+  mutate(complete_frailty = ifelse(DT_FI + ST_FI == 0, 1, 0)) %>%
+  summarise(`UEF Frailty` = sum(complete_frailty))
+  
+biometrics <- p2_redcap_biometrics %>%
+  filter(hml_id %in% freeze_ids) %>%
+  select(bio_height, bio_height_ft, bio_height_in, bio_weight, 
+         bmr, body_fat, body_water, bone_mass, bp_l_diastolic_1, 
+         bp_l_diastolic_2, bp_l_m_diastolic, bp_l_m_systolic, 
+         bp_l_systolic_1, bp_l_systolic_2, bp_r_diastolic_1, 
+         bp_r_diastolic_2, bp_r_m_diastolic, bp_r_m_systolic, 
+         bp_r_systolic_1, bp_r_systolic_2, hip_circum, met_age, 
+         muscle_mass, physique_rating, pulse, sp02, visceral_fat, 
+         waist_circum, waist_hip_ratio) %>%
+  mutate(across(everything(), ~ifelse(is.na(.), 1, 0))) %>%
+  mutate(missing_biometrics = rowSums(select(., everything())),
+         complete_biometrics = ifelse(missing_biometrics == 0, 1, 0)) %>%
+  summarise(`Biometrics` = sum(complete_biometrics))
+
+health_intake <- p2_redcap_health_intake %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_health_intake = ifelse(health_intake_complete == 2, 1, 0))  %>%
+  summarise(`Health Intake` = sum(complete_health_intake))
+
+phq9 <- p2_redcap_cognitive_function_phq9 %>%
+  filter(hml_id %in% freeze_ids) %>%
+  summarise(`PHQ-9` = sum(phq9_complete, na.rm = T))
+
+psychosocial_visits_dat <- cross_join(biometrics, health_intake) %>%
+  cross_join(language) %>%
+  cross_join(phq9) %>%
+  cross_join(frailty) %>%
+  pivot_longer(everything()) %>%
+  mutate(value = paste0(value, " (", round(value/length(freeze_ids) * 100, 2), "%)"))
+
+```
+
+```{r create-table}
+
+psychosocial_visits_dat %>%
+  flextable() %>%
+  set_header_labels(name = "", value = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit()
+
+```

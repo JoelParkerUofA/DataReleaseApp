@@ -1,0 +1,101 @@
+---
+output:
+   html_document:
+    self_contained: true
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r setup}
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = Sys.getenv("user")
+                 , password = Sys.getenv("password")
+                 , dbname = Sys.getenv("dbname")
+                 , host = Sys.getenv("host")
+                 , port = Sys.getenv("port")
+                 , sslrootcert = 'global-bundle.pem'
+)
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+```{r}
+
+survey_names <- c("adl", "anxiety", "brain_disease", "covid", "diet", "fhad", 
+           "health_medical", "perceived_stress", "qpar", "ses", "sleep",
+           "social_stressor", "social_support", "subjective_english", "swls")
+
+raw_survey_list <- lapply(survey_names, 
+                          function(x){
+                            if(x == "fhad"){
+                              new_x <- dbReadTable(con, paste0("p2_redcap_", "family_history"))
+                            }else{
+                              new_x <- dbReadTable(con, paste0("p2_redcap_", x))
+                            }
+                            
+                            x <- case_when(x == "health_medical" ~ "healthmed",
+                                           x == "perceived_stress" ~ "stress",
+                                           x == "social_stressor" ~ "socstress",
+                                           x == "social_support" ~ "socsupp",
+                                           x == "subjective_english" ~ "subeng",
+                                           TRUE ~ x)
+                            
+                            new_x %>%
+                              filter(visit == 1) %>%
+                              select(hml_id, all_of(paste0(x, "_complete")))
+                            
+                          })
+names(raw_survey_list) <- survey_names
+
+```
+
+```{r}
+
+reduce(raw_survey_list, full_join, by = "hml_id") %>%
+  right_join(data.frame(hml_id = freeze_ids), by = "hml_id") %>%
+  select(-hml_id) %>%
+  mutate(across(everything(), ~ifelse(is.na(.), 0, .))) %>%
+  rename("ADL" = "adl_complete",
+         "Anxiety" = "anxiety_complete",
+         "Stress" = "stress_complete",
+         "QPAR" = "qpar_complete",
+         "Sleep" = "sleep_complete",
+         "Social Stressors" = "socstress_complete",
+         "Social Support" = "socsupp_complete",
+         "SWLS" = "swls_complete",
+         "Covid" = "covid_complete",
+         "Diet" = "diet_complete",
+         "FHAD" = "fhad_complete",
+         "Health Medical" = "healthmed_complete",
+         "SES" = "ses_complete",
+         "Subjective English" = "subeng_complete",
+         "Brain Disease" = "brain_disease_complete") %>%
+  pivot_longer(cols = everything(), names_to = "survey", values_to = "available") %>%
+  group_by(survey) %>%
+  mutate(total = n()) %>%
+  group_by(total, .add = TRUE) %>%
+  summarise(sum_available = sum(available)) %>%
+  ungroup() %>%
+  mutate(percent_available = round(sum_available/total, 3) * 100,
+         percent_available = paste0(sum_available, " (", percent_available, "%)")) %>%
+  select(survey, percent_available) %>%
+  flextable() %>%
+  set_header_labels(survey = "", percent_available = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit()
+
+```
+

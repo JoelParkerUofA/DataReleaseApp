@@ -1,0 +1,125 @@
+---
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: false
+  message: false
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+load("dbconnect_info.Rdata")
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = dbconnect_info$user,
+                 password = dbconnect_info$password, 
+                 dbname = dbconnect_info$dbname,
+                 host = dbconnect_info$host,
+                 port = dbconnect_info$port,
+                 sslrootcert = 'global-bundle.pem'
+)
+
+
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+## Non-Invasive Technology
+
+```{r pull-data}
+
+#############
+## 1. Wearables (Garmin)
+
+## 2. Language and Speech Task
+#
+## 3. Frailty (Upper Extremity Function)
+#
+#  4. Cortisol 
+##
+
+coref_najafi_garmin <- dbReadTable(con, "coref_najafi_garmin")
+
+coref_mehl_languagespeechtask <- dbReadTable(con, "coref_mehl_languagespeechtask")
+
+coref_najafi_frailty <- dbReadTable(con, "coref_najafi_frailty")
+
+coref_runyon_cortisol <- dbReadTable(con, "coref_runyon_cortisol")
+
+```
+
+```{r wrangle-data}
+
+# Note: Need to check formantposition variable ("Not enough samples")
+garmin <- coref_najafi_garmin %>%
+  right_join(data.frame(hml_id = freeze_ids), by = "hml_id") %>%
+  mutate(days_of_recording = as.numeric(days_of_recording),
+         days_of_recording = ifelse(is.na(days_of_recording), 0, days_of_recording),
+         # Data available if participant wore watch at least one day
+         greater_than_zero = ifelse(days_of_recording > 0, 1, 0),
+         sum_greater_than_zero = sum(greater_than_zero),
+         # 8to8 and 10hr data is missing for some participants
+         complete_data = ifelse(!is.na(mean_daily_steps_8to8), 1, 0),
+         sum_complete_data = sum(complete_data),
+         # Total participants
+         n = n()) %>%
+  filter(greater_than_zero == 1) %>%
+  # Get range of days of recording
+  mutate(range_days_of_recording = paste0(median(days_of_recording), 
+                                          " [", quantile(days_of_recording, .25), " - ",
+                                          quantile(days_of_recording, .75), "]")) %>%
+  select(range_days_of_recording, sum_greater_than_zero, sum_complete_data, n) %>%
+  distinct() %>%
+  select(`Garmin`= sum_complete_data)
+
+language <- coref_mehl_languagespeechtask %>%
+  filter(hml_id %in% freeze_ids) %>%
+  select(hml_id, formantposition, inputfile) %>%
+  mutate(formantposition = ifelse(formantposition == "Not enough samples, requires at least 30", 1, 0)) %>%
+  summarise(missing_data = sum(formantposition, na.rm = T), .by = "hml_id") %>%
+  mutate(complete_language = ifelse(missing_data == 0, 1, 0)) %>%
+  summarise(`Language Speech Task` = sum(complete_language))
+
+frailty <- coref_najafi_frailty %>%
+  filter(hml_id %in% freeze_ids) %>%
+  select(DT_FI, ST_FI) %>%
+  mutate(across(everything(), ~ifelse(is.na(.), 1, 0))) %>%
+  mutate(complete_frailty = ifelse(DT_FI + ST_FI == 0, 1, 0)) %>%
+  summarise(`UEF Frailty` = sum(complete_frailty))
+  
+cortisol <- coref_runyon_cortisol %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_cortisol = ifelse(!is.na(cortisol), 1, 0)) %>%
+  summarise(Cortisol = sum(complete_cortisol))
+
+psychosocial_visits_dat <- cross_join(garmin,language) %>%
+  cross_join(frailty) %>%
+  cross_join(cortisol) %>%
+  pivot_longer(everything()) %>%
+  mutate(value = paste0(value, " (", round(value/length(freeze_ids) * 100, 2), "%)"))
+
+```
+
+```{r create-table}
+
+psychosocial_visits_dat %>%
+  flextable() %>%
+  set_header_labels(name = "", value = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit()
+
+```

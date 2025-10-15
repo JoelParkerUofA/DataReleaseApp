@@ -1,0 +1,137 @@
+---
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: false
+  message: false
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+load("dbconnect_info.Rdata")
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = dbconnect_info$user,
+                 password = dbconnect_info$password, 
+                 dbname = dbconnect_info$dbname,
+                 host = dbconnect_info$host,
+                 port = dbconnect_info$port,
+                 sslrootcert = 'global-bundle.pem'
+)
+
+
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+## Labs & Biomarkers Table
+
+```{r pull-data}
+
+coreg_ad_plasma_biomarkers <- dbGetQuery(con, "SELECT hml_id, abeta_40 FROM coreg_ad_plasma_biomarkers")
+
+coreg_doyle_cytokine <- dbReadTable(con, "coreg_doyle_cytokine") # Millipore Plasma Cytokines
+
+coreg_nulisaseq <- dbGetQuery(con, "SELECT hml_id, apoe FROM coreg_nulisaseq") # NULISA CNS Disease Panel
+
+coreg_huentelman_apoe4 <- dbGetQuery(con, "SELECT hml_id, apoe_status FROM coreg_huentelman_apoe4")
+
+coreg_huentelman_epigenetic <- dbGetQuery(con, "SELECT hml_id, horvath2013 FROM coreg_huentelman_epigenetic")
+
+coreg_huentelman_prs <- dbGetQuery(con, "SELECT hml_id, adhd FROM coreg_huentelman_prs")
+
+
+p2_sonora_quest_labwork <- dbReadTable(con, "p2_sonora_quest_labwork")
+
+```
+
+```{r wrangle-data}
+
+
+biomarkers <- coreg_ad_plasma_biomarkers %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_biomarkers = ifelse(!is.na(abeta_40), 1, 0))  %>%
+  summarise(`AD Plasma Biomarkers` = sum(complete_biomarkers))
+
+millipore <- coreg_doyle_cytokine %>%
+  filter(hml_id %in% freeze_ids) %>%
+  select(hml_id, 
+         Eotaxin, Fgf2, IFNg, IL_10, IL_12p40, IL_13, IL_15, 
+         IL_17a, IL_1a, IL_1b, IL_2, IL_4, IL_5, IL_6, IL_7, 
+         IL_8, IP_10, MCP_1, MDC, MIP_1a, MIP_1b, TNFa, TNFb, VEGFa) %>%
+  mutate(across(-hml_id, ~ifelse(is.na(.), 1, 0 ))) %>%
+  mutate(sum_missing = rowSums(select(., -hml_id)),
+         millipore_complete = ifelse(sum_missing == 0, 1, 0))  %>%
+  summarise(`Millipore Cytokine Assay` = sum(millipore_complete))
+
+nulisa <- coreg_nulisaseq %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_nulisa = ifelse(!is.na(apoe), 1, 0))  %>%
+  summarise(`NULISA Seq CNS Disease Panel` = sum(complete_nulisa))
+
+apoe <- coreg_huentelman_apoe4 %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_apoe = ifelse(!is.na(apoe_status), 1, 0))  %>%
+  summarise(`APOE4 Status` = sum(complete_apoe))
+
+epigenetic <- coreg_huentelman_epigenetic %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_epigenetic = ifelse(!is.na(horvath2013), 1, 0))  %>%
+  summarise(`Epigenetic Clocks` = sum(complete_epigenetic))
+
+prs <- coreg_huentelman_prs %>%
+  filter(hml_id %in% freeze_ids) %>%
+  mutate(complete_prs = ifelse(!is.na(adhd), 1, 0))  %>%
+  summarise(`Polygenic Risk Scores` = sum(complete_prs))
+
+labwork <- p2_sonora_quest_labwork %>%
+  filter(hml_id %in% freeze_ids) %>%
+  filter(visit == 1) %>%
+  select(hml_id, alanine_aminotransferase, albumin, albumin_globulin_ratio, 
+         alkaline_phosphatase, anion_gap, aspartate_aminotransferase, 
+         bilirubin_total, bun_creatinine_ratio, calcium, carbon_dioxide_co2, 
+         chloride, cholesterol, cholesterol_hdl_ratio, creatinine, 
+         crp_high_sensitivity, egfrcr_ckd_epi, estimated_average_glucose_eag, 
+         globulin, glucose, hdl_cholesterol, hemoglobin_a1c, insulin_fasting, 
+         ldl_cholesterol_calculated, non_hdl_cholesterol, potassium, 
+         protein_total, sodium, triglycerides, urea_nitrogen_bun, 
+         vldl_cholesterol) %>%
+  mutate(across(-hml_id, ~ifelse(is.na(.), 1, 0 ))) %>%
+  mutate(sum_missing = rowSums(select(., -hml_id)),
+         labwork_complete = ifelse(sum_missing == 0, 1, 0))  %>%
+  summarise(`Sonora Quest Blood Chemistries` = sum(labwork_complete))
+
+lab_biomarkers_dat <- cross_join(biomarkers, apoe) %>%
+  cross_join(epigenetic) %>%
+  cross_join(millipore) %>%
+  cross_join(nulisa) %>%
+  cross_join(prs) %>%
+  cross_join(labwork) %>%
+  pivot_longer(everything()) %>%
+  mutate(value = paste0(value, " (", round(value/length(freeze_ids) * 100, 2), "%)"))
+
+```
+
+```{r create-table}
+
+lab_biomarkers_dat %>%
+  flextable() %>%
+  set_header_labels(name = "", value = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit()
+
+```

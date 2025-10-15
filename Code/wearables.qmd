@@ -1,0 +1,88 @@
+---
+output:
+   html_document:
+    self_contained: true
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r setup}
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = Sys.getenv("user")
+                 , password = Sys.getenv("password")
+                 , dbname = Sys.getenv("dbname")
+                 , host = Sys.getenv("host")
+                 , port = Sys.getenv("port")
+                 , sslrootcert = 'global-bundle.pem'
+)
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+## Wearables (Garmin) Table
+
+```{r pull-data}
+
+coref_najafi_garmin <- dbReadTable(con, "coref_najafi_garmin")
+
+```
+
+```{r wrangle-data}
+
+raw_garmin_table_dat <- coref_najafi_garmin %>%
+  right_join(data.frame(hml_id = freeze_ids), by = "hml_id") %>%
+  mutate(days_of_recording = as.numeric(days_of_recording),
+         days_of_recording = ifelse(is.na(days_of_recording), 0, days_of_recording),
+         # Data available if participant wore watch at least one day
+         greater_than_zero = ifelse(days_of_recording > 0, 1, 0),
+         sum_greater_than_zero = sum(greater_than_zero),
+         # 8to8 and 10hr data is missing for some participants
+         complete_data = ifelse(!is.na(mean_daily_steps_8to8), 1, 0),
+         sum_complete_data = sum(complete_data),
+         # Total participants
+         n = n()) %>%
+  filter(greater_than_zero == 1) %>%
+  # Get range of days of recording
+  mutate(range_days_of_recording = paste0(median(days_of_recording), 
+                                          " [", quantile(days_of_recording, .25), " - ",
+                                          quantile(days_of_recording, .75), "]")) %>%
+  select(range_days_of_recording, sum_greater_than_zero, sum_complete_data, n) %>%
+  distinct() 
+
+num_available <- raw_garmin_table_dat$sum_greater_than_zero
+
+garmin_table_dat <- raw_garmin_table_dat %>%
+  # Get percentages
+  mutate(percent_complete_data = paste0(sum_complete_data, " (", round(sum_complete_data/n * 100, 2), "%)")) %>%
+  select(percent_complete_data, range_days_of_recording) %>%
+  pivot_longer(cols = everything()) %>%
+  mutate(name = case_when(name == "percent_complete_data" ~ "Complete Garmin Data",
+                          name == "range_days_of_recording" ~ "Days of Recording (Median [IQR])"))
+
+
+```
+
+```{r create-table}
+
+# Note: need to check if calculating percent based on number of participants in freeze or number that had Garmin watches
+
+garmin_table_dat %>%
+  flextable() %>%
+  set_header_labels(name = "", value = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit()
+
+```

@@ -1,0 +1,154 @@
+---
+format:
+  html:
+    embed-resources: true
+---
+
+```{r setup, warning=FALSE, echo=FALSE, message=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Freeze date
+freeze_date <- as.Date("2025-06-30")
+
+# Load packages
+library(DBI) # Connecting to database
+library(tidyverse) # Data wrangling
+library(flextable) # Pretty table
+
+load("dbconnect_info.Rdata")
+
+# Connect to PAN database
+con <- dbConnect(RPostgres::Postgres(),
+                 user = dbconnect_info$user,
+                 password = dbconnect_info$password, 
+                 dbname = dbconnect_info$dbname,
+                 host = dbconnect_info$host,
+                 port = dbconnect_info$port,
+                 sslrootcert = 'global-bundle.pem'
+)
+
+
+source("get_participant_ids.R")
+freeze_ids <- get_participant_ids(freeze_date)
+
+```
+
+```{r pull-mc-cognitive-function-task-data,warning=FALSE, echo=FALSE, message=FALSE}
+
+scores_flk <- dbGetQuery(con, "SELECT * FROM scores_flk WHERE hml_id is not NULL") %>%
+  filter(FLK_first_attempt) %>%
+  mutate(flk_complete = ifelse(FLK_qc_code == "QC passed", "Complete", "Incomplete")) %>%
+  select(hml_id, flk_complete)
+
+scores_kt <- dbGetQuery(con, "SELECT * FROM scores_kt WHERE hml_id is not NULL") %>%
+  filter(KT_first_attempt) %>%
+  mutate(kt_complete = ifelse(KT_qc_code == "QC passed", "Complete", "Incomplete")) %>%
+  select(hml_id, kt_complete)
+
+scores_ln <- dbGetQuery(con, "SELECT * FROM scores_ln WHERE hml_id is not NULL") %>%
+  filter(LN_first_attempt) %>%
+  mutate(ln_complete = ifelse(LN_qc_code == "QC passed", "Complete", "Incomplete")) %>%
+  select(hml_id, ln_complete)
+
+scores_scrt <- dbGetQuery(con, "SELECT * FROM scores_scrt WHERE hml_id is not NULL") %>%
+  filter(SCRT_first_attempt) %>%
+  mutate(scrt_complete = ifelse(SCRT_qc_code == "QC passed", "Complete", "Incomplete")) %>%
+  select(hml_id, scrt_complete)
+
+scores_wp <- dbGetQuery(con, "SELECT * FROM scores_wp WHERE hml_id is not NULL") %>%
+  filter(WP_first_attempt) %>%
+  mutate(wp_complete = ifelse(WP_qc_code == "QC passed", "Complete", "Incomplete")) %>%
+  select(hml_id, wp_complete)
+
+cog_scores <- data.frame(hml_id = freeze_ids) %>%
+  left_join(scores_flk, by = "hml_id") %>%
+  left_join(scores_kt, by = "hml_id") %>%
+  left_join(scores_ln, by = "hml_id") %>%
+  left_join(scores_scrt, by = "hml_id") %>%
+  left_join(scores_wp, by = "hml_id") %>%
+  mutate(across(-hml_id, ~ifelse(is.na(.), "Incomplete", "Complete"))) %>%
+  distinct() %>%
+  select(-hml_id) %>%
+  mutate(across(everything(), ~ifelse(. == "Incomplete", 0, 1)))
+
+```
+
+```{r create-percent-available-table,warning=FALSE, echo=FALSE, message=FALSE}
+
+games_tab <- cog_scores %>%
+  pivot_longer(cols = everything(), names_to = "game", values_to = "available") %>%
+  group_by(game) %>%
+  mutate(total = n()) %>%
+  group_by(total, .add = TRUE) %>%
+  summarise(sum_available = sum(available)) %>%
+  ungroup() %>%
+  mutate(percent_available = round(sum_available/total, 3) * 100,
+         percent_available = paste0(sum_available, " (", percent_available, "%)")) %>%
+  select(game, percent_available) %>%
+  mutate(game = str_remove(game, "_complete"),
+         game = case_when(game == "flk" ~ "Flanker Task",
+                          game == "kt" ~ "Keep Track Task",
+                          game == "ln" ~ "Letter Number Task",
+                          game == "scrt" ~ "Simple and Choice Reaction Time",
+                          game == "wp" ~ "Verbal Paired Associate Learning "))
+```
+
+```{r pull-data,warning=FALSE, echo=FALSE, message=FALSE}
+
+p2_redcap_cognitive_function_avlt <- dbGetQuery(con, "SELECT hml_id, avlt_complete FROM p2_redcap_cognitive_function_avlt")
+
+p2_redcap_cognitive_function_moca <- dbGetQuery(con, "SELECT hml_id, moca_complete FROM p2_redcap_cognitive_function_moca")
+
+p2_redcap_cognitive_function_naart <- dbGetQuery(con, "SELECT hml_id, naart_complete FROM p2_redcap_cognitive_function_naart")
+
+p2_redcap_cognitive_function_phq9 <- dbGetQuery(con, "SELECT hml_id, phq9_complete FROM p2_redcap_cognitive_function_phq9")
+
+```
+
+```{r wrangle-data,warning=FALSE, echo=FALSE, message=FALSE}
+
+cognitive_function_table_dat <- data.frame(hml_id = freeze_ids) %>%
+  left_join(p2_redcap_cognitive_function_avlt, by = "hml_id") %>%
+  left_join(p2_redcap_cognitive_function_moca, by = "hml_id") %>%
+  left_join(p2_redcap_cognitive_function_naart, by = "hml_id") %>%
+  left_join(p2_redcap_cognitive_function_phq9, by = "hml_id") %>%
+  select(-hml_id) %>%
+  mutate(across(everything(), ~ifelse(is.na(.), 0, .))) %>%
+  summarise(avlt = sum(avlt_complete),
+            moca = sum(moca_complete),
+            naart = sum(naart_complete),
+            'PHQ-9*' = sum(phq9_complete)) %>%
+  pivot_longer(everything()) %>%
+  mutate(value = paste0(value, " (", round(value/length(freeze_ids) * 100, 2), "%)"),
+         name = str_to_upper(name),
+         name = ifelse(name == "MOCA", "MoCA", name))
+
+```
+
+
+## Cognitive Function Tests
+```{r create-table,warning=FALSE, echo=FALSE, message=FALSE}
+# Rename games names to match other test names
+names(games_tab) <- c("name", "value")
+
+cognitive_function_table <- rbind(cognitive_function_table_dat, games_tab) %>%
+  flextable() %>%
+  set_header_labels(name = "", value = paste0("Available \n (N=", length(freeze_ids),")")) %>%
+  autofit() %>%
+  add_footer_lines( value = " *PHQ-9 is a depression screening tool")
+
+
+cognitive_function_table
+```
+
+```{r test numbers,warning=FALSE, echo=FALSE, message=FALSE, eval=FALSE}
+
+p2_redcap_cognitive_function_avlt %>%
+  filter(avlt_complete == 1 & hml_id %in% freeze_ids) %>%
+  nrow()
+
+p2_redcap_cognitive_function_phq9 %>%
+  filter(phq9_complete == 1 & hml_id %in% freeze_ids) %>%
+  nrow()
+```
