@@ -1,6 +1,6 @@
 # This script has the function which pulls the list of participants included in the data freeze
 
-get_participant_ids <- function(freeze_date){
+get_participant_ids <- function(freeze_date, con){
   beta_freeze_date <- as.Date("2024-12-31")
   freeze_date <- as.Date(freeze_date)
   
